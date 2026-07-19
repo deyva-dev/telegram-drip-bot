@@ -1,0 +1,40 @@
+[
+  {
+    "day": 0,
+    "type": "text",
+    "content": "🎉 <b>Welcome to the Academy!</b>\n\nOver the next few weeks you'll get bite-sized lessons delivered right here — no scrolling through group chat history required. Let's get started."
+  },
+  {
+    "day": 0,
+    "type": "photo",
+    "content": "https://example.com/images/welcome-banner.jpg",
+    "caption": "Here's a quick look at what you'll be learning."
+  },
+  {
+    "day": 2,
+    "type": "text",
+    "content": "<b>Lesson 1: Getting Started</b>\n\nReplace this with your real Day 2 content."
+  },
+  {
+    "day": 4,
+    "type": "document",
+    "content": "https://example.com/files/lesson1-worksheet.pdf",
+    "caption": "Your Lesson 1 worksheet — work through this before the next lesson drops."
+  },
+  {
+    "day": 7,
+    "type": "text",
+    "content": "<b>Lesson 2: Building Momentum</b>\n\nReplace this with your real Day 7 content."
+  },
+  {
+    "day": 7,
+    "type": "link",
+    "content": "https://example.com/bonus-resource",
+    "caption": "🎁 Bonus resource for this week:"
+  },
+  {
+    "day": 10,
+    "type": "text",
+    "content": "<b>Lesson 3: Putting It Together</b>\n\nReplace this with your real Day 10 content."
+  }
+]
