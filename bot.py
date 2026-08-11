@@ -10,6 +10,11 @@ Content is managed entirely through bot commands (/addcontent,
 /listcontent, /deletecontent) and stored in the database — so adding
 next week's lesson never requires a redeploy or touching code.
 
+Each piece of content can also have a DELAY (in minutes) after its
+day begins — so a single day's lesson can unfold as several messages
+(text, then an image, then more text...) spaced out naturally instead
+of all landing at once.
+
 Run locally:
     pip install -r requirements.txt
     cp .env.example .env   # then fill in your bot token
@@ -21,7 +26,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -40,9 +45,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").lstrip("@")  # e.g. "gloria_studyquay" (no @)
 DB_PATH = os.getenv("DB_PATH", "drip_bot.db")
 SEED_CONTENT_PATH = os.getenv("SEED_CONTENT_PATH", "content.json")
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))  # default: hourly
+# Checked frequently (default: every 5 min) so that within-day delays
+# (e.g. "10 minutes after Day 7 starts") fire close to on time. If you
+# only ever use whole-day scheduling with no delays, this can safely be
+# a larger number (e.g. 3600 for hourly) to reduce resource usage.
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -51,7 +61,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states for /addcontent
-ASK_DAY, ASK_TYPE, ASK_CONTENT, ASK_CAPTION, CONFIRM = range(5)
+ASK_DAY, ASK_DELAY, ASK_TYPE, ASK_CONTENT, ASK_CAPTION, CONFIRM = range(6)
 
 
 def is_admin(user_id: int) -> bool:
@@ -86,6 +96,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS content (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             day INTEGER NOT NULL,
+            delay_minutes INTEGER NOT NULL DEFAULT 0,
             type TEXT NOT NULL,
             content TEXT NOT NULL,
             caption TEXT,
@@ -93,6 +104,19 @@ def init_db():
         )
     """)
     conn.commit()
+    conn.close()
+
+
+def migrate_db():
+    """Adds delay_minutes to older databases created before this feature existed."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(content)")
+    columns = [row[1] for row in cur.fetchall()]
+    if "delay_minutes" not in columns:
+        cur.execute("ALTER TABLE content ADD COLUMN delay_minutes INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+        logger.info("Migrated content table: added delay_minutes column")
     conn.close()
 
 
@@ -110,7 +134,13 @@ def seed_content_from_json():
     with open(SEED_CONTENT_PATH, "r", encoding="utf-8") as f:
         items = json.load(f)
     for item in items:
-        add_content_item(item.get("day", 0), item.get("type", "text"), item.get("content", ""), item.get("caption"))
+        add_content_item(
+            item.get("day", 0),
+            item.get("type", "text"),
+            item.get("content", ""),
+            item.get("caption"),
+            item.get("delay_minutes", 0),
+        )
     logger.info("Seeded %d content items from %s", len(items), SEED_CONTENT_PATH)
 
 
@@ -158,12 +188,12 @@ def mark_sent(chat_id, content_id):
     conn.close()
 
 
-def add_content_item(day, ctype, content, caption):
+def add_content_item(day, ctype, content, caption, delay_minutes=0):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO content (day, type, content, caption, created_at) VALUES (?, ?, ?, ?, ?)",
-        (day, ctype, content, caption, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO content (day, delay_minutes, type, content, caption, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (day, delay_minutes, ctype, content, caption, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     new_id = cur.lastrowid
@@ -174,10 +204,13 @@ def add_content_item(day, ctype, content, caption):
 def load_content():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT id, day, type, content, caption FROM content ORDER BY day, id")
+    cur.execute("SELECT id, day, delay_minutes, type, content, caption FROM content ORDER BY day, delay_minutes, id")
     rows = cur.fetchall()
     conn.close()
-    return [{"id": r[0], "day": r[1], "type": r[2], "content": r[3], "caption": r[4]} for r in rows]
+    return [
+        {"id": r[0], "day": r[1], "delay_minutes": r[2], "type": r[3], "content": r[4], "caption": r[5]}
+        for r in rows
+    ]
 
 
 def delete_content_item(content_id):
@@ -226,11 +259,12 @@ async def check_and_send(context: ContextTypes.DEFAULT_TYPE):
 
     for chat_id, joined_at in subscribers:
         joined_dt = datetime.fromisoformat(joined_at)
-        days_elapsed = (now - joined_dt).days
 
-        due_items = [c for c in content_items if c["day"] <= days_elapsed]
-        for item in due_items:
+        for item in content_items:
             if already_sent(chat_id, item["id"]):
+                continue
+            due_at = joined_dt + timedelta(days=item["day"], minutes=item.get("delay_minutes", 0) or 0)
+            if now < due_at:
                 continue
             success = await send_content_item(bot, chat_id, item)
             if success:
@@ -252,7 +286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Welcome! You're enrolled. Your content drip starts today, on the same "
             "schedule as everyone else — counting from now, not from any fixed calendar date."
         )
-        await check_and_send(context)  # deliver Day 0 content immediately
+        await check_and_send(context)  # deliver anything due for Day 0 with 0 delay right away
     else:
         await update.message.reply_text("You're already enrolled — your next lesson is on its way.")
 
@@ -297,6 +331,27 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+async def redirect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches anything a subscriber sends that isn't a recognized command
+    (this bot doesn't hold conversations) and points them to a real DM
+    instead of leaving them on read."""
+    user = update.effective_user
+    if not update.message or (user and is_admin(user.id)):
+        return  # never intercepts the admin — needed so /addcontent's own
+                 # text/photo/document replies aren't swallowed by this
+
+    if ADMIN_USERNAME:
+        link = f"https://t.me/{ADMIN_USERNAME}"
+        text = (
+            "Thanks for your message! This chat is just for delivering your lessons on schedule, "
+            f"so I can't reply here. For questions or anything else, message me directly: {link}"
+        )
+    else:
+        text = "Thanks for your message! This chat is just for delivering your lessons on schedule."
+
+    await update.message.reply_text(text, disable_web_page_preview=True)
+
+
 # ---------------------------------------------------------------------------
 # Admin: stats
 # ---------------------------------------------------------------------------
@@ -324,7 +379,7 @@ async def addcontent_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
         "Let's add new content.\n\n"
-        "What day should this go out on? (0 = sent immediately when someone joins, "
+        "What day should this go out on? (0 = the day someone joins, "
         "7 = one week in, 14 = two weeks in, etc.)\n\n"
         "Send /cancel anytime to stop."
     )
@@ -343,10 +398,52 @@ async def ask_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["day"] = day
     keyboard = [
+        [InlineKeyboardButton("Right away", callback_data="0")],
+        [InlineKeyboardButton("+15 min", callback_data="15"), InlineKeyboardButton("+30 min", callback_data="30")],
+        [InlineKeyboardButton("+1 hour", callback_data="60"), InlineKeyboardButton("+2 hours", callback_data="120")],
+        [InlineKeyboardButton("Custom (type a number)", callback_data="custom")],
+    ]
+    await update.message.reply_text(
+        f"Got it — Day {day}.\n\n"
+        "Should this go out right when Day " + str(day) + " starts, or a bit later "
+        "(useful for spacing out multiple messages within the same day's lesson)?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ASK_DELAY
+
+
+async def ask_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "custom":
+        await query.edit_message_text("How many minutes after Day " + str(context.user_data["day"]) + " starts? (type a number, e.g. 45)")
+        return ASK_DELAY  # stays in this state, but now expects a text reply — see ask_delay_custom below
+
+    context.user_data["delay_minutes"] = int(query.data)
+    return await proceed_to_type_selection(update, context)
+
+
+async def ask_delay_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the typed-number reply after 'Custom' was tapped."""
+    try:
+        minutes = int(update.message.text.strip())
+        if minutes < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("That doesn't look like a valid number of minutes. Try again, e.g. 45")
+        return ASK_DELAY
+    context.user_data["delay_minutes"] = minutes
+    return await proceed_to_type_selection(update, context)
+
+
+async def proceed_to_type_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
         [InlineKeyboardButton("📝 Text", callback_data="text"), InlineKeyboardButton("🖼 Photo", callback_data="photo")],
         [InlineKeyboardButton("📄 Document", callback_data="document"), InlineKeyboardButton("🔗 Link", callback_data="link")],
     ]
-    await update.message.reply_text("What type of content is this?", reply_markup=InlineKeyboardMarkup(keyboard))
+    target = update.effective_message
+    await target.reply_text("What type of content is this?", reply_markup=InlineKeyboardMarkup(keyboard))
     return ASK_TYPE
 
 
@@ -421,9 +518,12 @@ async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview = str(d.get("content", ""))
     if len(preview) > 80:
         preview = preview[:80] + "..."
+    delay = d.get("delay_minutes", 0)
+    timing = "immediately" if delay == 0 else f"{delay} minutes after Day {d['day']} starts"
     summary = (
         "Here's what I've got:\n\n"
         f"Day: {d['day']}\n"
+        f"Timing: {timing}\n"
         f"Type: {d['type']}\n"
         f"Content: {preview}\n"
         f"Caption: {d.get('caption') or '(none)'}\n\n"
@@ -439,10 +539,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.data == "save":
         d = context.user_data
-        content_id = add_content_item(d["day"], d["type"], d["content"], d.get("caption"))
+        content_id = add_content_item(d["day"], d["type"], d["content"], d.get("caption"), d.get("delay_minutes", 0))
+        delay = d.get("delay_minutes", 0)
+        timing = "right when it starts" if delay == 0 else f"{delay} minutes after it starts"
         await query.edit_message_text(
-            f"Saved as content #{content_id}, scheduled for Day {d['day']}. "
-            "It'll go out automatically to anyone who's reached that day — no redeploy needed."
+            f"Saved as content #{content_id}, scheduled for Day {d['day']} ({timing}). "
+            "It'll go out automatically — no redeploy needed."
         )
     else:
         await query.edit_message_text("Discarded — nothing was saved.")
@@ -473,7 +575,9 @@ async def listcontent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = str(it["content"])
         if len(preview) > 40:
             preview = preview[:40] + "..."
-        lines.append(f"#{it['id']} | Day {it['day']} | {it['type']} | {preview}")
+        delay = it.get("delay_minutes", 0)
+        timing = "Day {}".format(it["day"]) if not delay else f"Day {it['day']} +{delay}m"
+        lines.append(f"#{it['id']} | {timing} | {it['type']} | {preview}")
     text = "\n".join(lines)
 
     for start_idx in range(0, len(text), 3500):
@@ -510,6 +614,7 @@ def main():
         raise RuntimeError("BOT_TOKEN not set. Add it to your .env file (see .env.example).")
 
     init_db()
+    migrate_db()
     seed_content_from_json()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -526,6 +631,11 @@ def main():
         entry_points=[CommandHandler("addcontent", addcontent_start)],
         states={
             ASK_DAY: [CommandHandler("cancel", cancel), MessageHandler(filters.TEXT & ~filters.COMMAND, ask_day)],
+            ASK_DELAY: [
+                CommandHandler("cancel", cancel),
+                CallbackQueryHandler(ask_delay),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_delay_custom),
+            ],
             ASK_TYPE: [CommandHandler("cancel", cancel), CallbackQueryHandler(ask_type)],
             ASK_CONTENT: [CommandHandler("cancel", cancel), MessageHandler(filters.ALL & ~filters.COMMAND, ask_content)],
             ASK_CAPTION: [
@@ -539,8 +649,15 @@ def main():
     )
     app.add_handler(conv_handler)
 
-    # Check for due content on a timer (default hourly) — catches anyone
-    # whose next piece became due since they last interacted with the bot.
+    # Catches any other message from subscribers (this bot doesn't hold
+    # conversations) and redirects them to a real DM. Registered in group=1
+    # so it runs after commands/the /addcontent conversation; is_admin()
+    # inside the handler also excludes the admin explicitly either way.
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, redirect_message), group=1)
+
+    # Check for due content on a timer (default every 5 min) — catches
+    # anyone whose next piece became due since they last interacted with
+    # the bot, including within-day delayed items.
     app.job_queue.run_repeating(check_and_send, interval=CHECK_INTERVAL_SECONDS, first=10)
 
     logger.info("Bot starting (polling)...")
